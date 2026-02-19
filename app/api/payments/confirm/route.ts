@@ -3,6 +3,7 @@ export const runtime = "nodejs";
 import { NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 import { sendAdminSms } from "@/lib/sms";
+import crypto from "crypto";
 
 type Body = { paymentKey: string; orderId: string; amount: number };
 
@@ -15,6 +16,39 @@ function fmtKst(iso: string) {
   const hh = String(k.getUTCHours()).padStart(2, "0");
   const mi = String(k.getUTCMinutes()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd} ${hh}:${mi}`;
+}
+
+// --- SOLAPI(문자) 직접 전송: 고객에게 보내기용 ---
+async function sendSms(to: string, text: string) {
+  const API_KEY = process.env.SOLAPI_API_KEY;
+  const API_SECRET = process.env.SOLAPI_API_SECRET;
+  const FROM = process.env.SMS_FROM;
+
+  if (!API_KEY || !API_SECRET) throw new Error("Missing SOLAPI_API_KEY/SOLAPI_API_SECRET");
+  if (!FROM) throw new Error("Missing SMS_FROM");
+  if (!to) throw new Error("Missing to");
+
+  const url = "https://api.solapi.com/messages/v4/send";
+  const date = new Date().toISOString();
+  const salt = crypto.randomBytes(16).toString("hex");
+  const signature = crypto.createHmac("sha256", API_SECRET).update(date + salt).digest("hex");
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `HMAC-SHA256 apiKey=${API_KEY}, date=${date}, salt=${salt}, signature=${signature}`,
+    },
+    body: JSON.stringify({
+      message: { to, from: FROM, text, type: "SMS" },
+    }),
+  });
+
+  const json = await resp.json();
+  if (!resp.ok) {
+    throw new Error(json?.errorMessage ?? json?.message ?? "SOLAPI send failed");
+  }
+  return json;
 }
 
 export async function POST(req: Request) {
@@ -30,7 +64,7 @@ export async function POST(req: Request) {
   // 1) 우리 DB의 PENDING 예약 찾기 + 금액 검증
   const { data: booking, error: bErr } = await supabaseServer
     .from("bookings")
-    .select("id, status, amount, start_at, end_at, room_id, rooms:room_id(name)")
+    .select("id, status, amount, start_at, end_at, room_id, customer_phone, customer_name, rooms:room_id(name)")
     .eq("order_id", orderId)
     .single();
 
@@ -81,10 +115,7 @@ export async function POST(req: Request) {
 
   if (!resp.ok) {
     // 실패면 예약 취소 처리
-    await supabaseServer
-      .from("bookings")
-      .update({ status: "CANCELED" })
-      .eq("id", booking.id);
+    await supabaseServer.from("bookings").update({ status: "CANCELED" }).eq("id", booking.id);
 
     return NextResponse.json(
       { ok: false, error: json?.message ?? "Toss confirm failed", detail: json },
@@ -106,11 +137,11 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: false, error: uErr.message }, { status: 500 });
   }
 
-  // 4) 확정된 직후 운영자 SMS 발송 (실패해도 예약확정은 유지)
-  try {
-    const start = booking.start_at ? fmtKst(booking.start_at) : "(시작없음)";
-    const end = booking.end_at ? fmtKst(booking.end_at) : "(종료없음)";
+  const start = booking.start_at ? fmtKst(booking.start_at) : "(시작없음)";
+  const end = booking.end_at ? fmtKst(booking.end_at) : "(종료없음)";
 
+  // 4) 운영자 SMS (실패해도 예약확정은 유지)
+  try {
     await sendAdminSms(
       `[Abbeyroad Studio] 예약 확정\n` +
         `룸: ${roomName}\n` +
@@ -120,7 +151,27 @@ export async function POST(req: Request) {
         `※ 24:00 마감 / 심야 유선문의`
     );
   } catch (e) {
-    console.error("[SMS] send failed", e);
+    console.error("[SMS] admin send failed", e);
+  }
+
+  // 5) ✅ 고객 SMS (SOLAPI 직접 호출)
+  try {
+    const to = (booking.customer_phone ?? "").trim();
+    if (to) {
+      await sendSms(
+        to,
+        `[Abbeyroad Studio] 예약이 확정되었습니다.\n` +
+          `룸: ${roomName}\n` +
+          `시간: ${start} ~ ${end}\n` +
+          `금액: ${Number(amount).toLocaleString()}원\n` +
+          `주문번호: ${orderId}\n` +
+          `※ 24:00 마감 / 심야 유선문의`
+      );
+    } else {
+      console.warn("[SMS] customer_phone missing; skip");
+    }
+  } catch (e) {
+    console.error("[SMS] customer send failed", e);
   }
 
   return NextResponse.json({ ok: true });
