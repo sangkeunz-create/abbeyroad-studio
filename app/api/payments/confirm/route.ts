@@ -30,24 +30,41 @@ export async function POST(req: Request) {
   // 1) 우리 DB의 PENDING 예약 찾기 + 금액 검증
   const { data: booking, error: bErr } = await supabaseServer
     .from("bookings")
-    // ✅ 문자에 필요한 정보까지 같이 가져오기 (컬럼명은 네 DB에 맞게 조정)
-    .select("id, status, amount, start_at, end_at, room_id, rooms(name)")
-
-
+    .select("id, status, amount, start_at, end_at, room_id, rooms:room_id(name)")
     .eq("order_id", orderId)
     .single();
 
-  if (bErr) return NextResponse.json({ ok: false, error: bErr.message }, { status: 500 });
-  if (booking.status !== "PENDING")
-    return NextResponse.json({ ok: false, error: "Not in PENDING state" }, { status: 400 });
+  if (bErr || !booking) {
+    return NextResponse.json(
+      { ok: false, error: bErr?.message ?? "Booking not found" },
+      { status: 500 }
+    );
+  }
+
+  if (booking.status !== "PENDING") {
+    return NextResponse.json(
+      { ok: false, error: "Not in PENDING state" },
+      { status: 400 }
+    );
+  }
 
   if (Number(booking.amount) !== Number(amount)) {
-    return NextResponse.json({ ok: false, error: "Amount mismatch" }, { status: 400 });
+    return NextResponse.json(
+      { ok: false, error: "Amount mismatch" },
+      { status: 400 }
+    );
   }
+
+  const roomName = (booking as any)?.rooms?.name ?? "(룸정보없음)";
 
   // 2) 토스 결제 승인(서버에서 secretKey로 confirm)
   const secretKey = process.env.TOSS_SECRET_KEY;
-  if (!secretKey) return NextResponse.json({ ok: false, error: "Missing TOSS_SECRET_KEY" }, { status: 500 });
+  if (!secretKey) {
+    return NextResponse.json(
+      { ok: false, error: "Missing TOSS_SECRET_KEY" },
+      { status: 500 }
+    );
+  }
 
   const auth = Buffer.from(`${secretKey}:`).toString("base64");
 
@@ -64,7 +81,11 @@ export async function POST(req: Request) {
 
   if (!resp.ok) {
     // 실패면 예약 취소 처리
-    await supabaseServer.from("bookings").update({ status: "CANCELED" }).eq("id", booking.id);
+    await supabaseServer
+      .from("bookings")
+      .update({ status: "CANCELED" })
+      .eq("id", booking.id);
+
     return NextResponse.json(
       { ok: false, error: json?.message ?? "Toss confirm failed", detail: json },
       { status: 400 }
@@ -74,15 +95,19 @@ export async function POST(req: Request) {
   // 3) 성공이면 예약 확정
   const { error: uErr } = await supabaseServer
     .from("bookings")
-    .update({ status: "CONFIRMED", payment_key: paymentKey, paid_at: new Date().toISOString() })
+    .update({
+      status: "CONFIRMED",
+      payment_key: paymentKey,
+      paid_at: new Date().toISOString(),
+    })
     .eq("id", booking.id);
 
-  if (uErr) return NextResponse.json({ ok: false, error: uErr.message }, { status: 500 });
+  if (uErr) {
+    return NextResponse.json({ ok: false, error: uErr.message }, { status: 500 });
+  }
 
-  // ✅ 4) 확정된 직후 운영자 SMS 발송 (실패해도 예약확정은 유지)
+  // 4) 확정된 직후 운영자 SMS 발송 (실패해도 예약확정은 유지)
   try {
-    const roomName = booking.rooms?.[0]?.name ?? "(룸정보없음)";
-
     const start = booking.start_at ? fmtKst(booking.start_at) : "(시작없음)";
     const end = booking.end_at ? fmtKst(booking.end_at) : "(종료없음)";
 
