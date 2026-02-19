@@ -31,7 +31,8 @@ export async function POST(req: Request) {
   const { data: booking, error: bErr } = await supabaseServer
     .from("bookings")
     // ✅ 문자에 필요한 정보까지 같이 가져오기 (컬럼명은 네 DB에 맞게 조정)
-    .select("id, status, amount, room_name, start_at, end_at")
+    .select("id, status, amount, room_id, start_at, end_at, customer_phone, rooms(name)")
+
     .eq("order_id", orderId)
     .single();
 
@@ -79,7 +80,8 @@ export async function POST(req: Request) {
 
   // ✅ 4) 확정된 직후 운영자 SMS 발송 (실패해도 예약확정은 유지)
   try {
-    const roomName = booking.room_name ?? "(룸정보없음)";
+    const roomName = booking.rooms?.name ?? "(룸정보없음)";
+
     const start = booking.start_at ? fmtKst(booking.start_at) : "(시작없음)";
     const end = booking.end_at ? fmtKst(booking.end_at) : "(종료없음)";
 
